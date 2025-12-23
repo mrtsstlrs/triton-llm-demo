@@ -1,0 +1,30 @@
+services:
+  triton:
+    image: ${TRITON_IMAGE}
+    container_name: triton-vllm
+    network_mode: "host"
+    gpus: all
+
+    env_file:
+      - .env
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN}
+
+    volumes:
+      - ${MODEL_REPO}:/models:ro
+      - ./hf_cache:/root/.cache/huggingface
+      - ./hf_home:/root/.huggingface
+
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - |
+        set -euo pipefail
+        mkdir -p /root/.huggingface
+        if [ -n "${HF_TOKEN:-}" ]; then
+          printf "%s" "$HF_TOKEN" > /root/.huggingface/token
+        fi
+        exec tritonserver --model-repository=/models --exit-on-error=false --log-verbose=1
+    ulimits:
+      memlock: -1
+      stack: 67108864
