@@ -1,0 +1,10 @@
+{
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "gpu_memory_utilization": 0.75,
+
+  "max_model_len": 4096,
+  "max_num_batched_tokens": 2048,
+  "max_num_seqs": 2,
+
+  "enable_chunked_prefill": true
+}
