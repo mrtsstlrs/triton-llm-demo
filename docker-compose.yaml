@@ -13,6 +13,7 @@ services:
     environment:
       HF_TOKEN: ${HF_TOKEN}
       HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
 
     volumes:
       - ${MODEL_REPO}:/models:ro
@@ -21,9 +22,20 @@ services:
 
     entrypoint: ["/bin/bash", "-lc"]
     command:
+      #todo: сделать нормально
       - |
         set -euo pipefail
         mkdir -p /root/.huggingface
+        # Ensure /lib symlink exists for libc linker scripts.
+        if [ ! -e /lib ]; then
+          ln -s /usr/lib /lib
+        fi
+        # Ensure libcuda.so exists for torch/triton JIT compilation.
+        for d in /usr/lib/x86_64-linux-gnu /usr/lib64; do
+          if [ -e "$$d/libcuda.so.1" ] && [ ! -e "$$d/libcuda.so" ]; then
+            ln -s "$$d/libcuda.so.1" "$$d/libcuda.so"
+          fi
+        done
         if [ -n "${HF_TOKEN:-}" ]; then
           printf "%s" "$HF_TOKEN" > /root/.huggingface/token
         fi
