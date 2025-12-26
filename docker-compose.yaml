@@ -27,7 +27,7 @@ services:
         if [ -n "${HF_TOKEN:-}" ]; then
           printf "%s" "$HF_TOKEN" > /root/.huggingface/token
         fi
-        exec tritonserver --model-repository=/models --exit-on-error=false --log-verbose=1
+        exec tritonserver --model-repository=/models --exit-on-error=false
     ulimits:
       memlock: -1
       stack: 67108864
