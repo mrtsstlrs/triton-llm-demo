@@ -1,49 +1,59 @@
 # syntax=docker/dockerfile:1.6
-FROM ubuntu:24.04
+# FROM ubuntu:24.04
+FROM registry.astralinux.ru/library/astra/ubi18-python311:1.8.5
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Версии, соответствующие стеку релиза 25.12 (см. NVIDIA release notes)
-# CUDA:   13.1.x
-# cuBLAS: 13.2.0.9
-# cuDNN:  9.17.1.4 (в apt репозитории без суффикса +cuda13.0)
-# TRT:    10.14.1 (в репозитории пакеты обычно 10.14.1.48-1+cuda13.0)
-ARG CUBLAS_VER="13.2.0.9-1"
-ARG CUDNN_VER="9.17.1.4-1"
-ARG TRT_VER="10.14.1.48-1+cuda13.0"
+# Версии, соответствующие стеку релиза Triton 24.04 (см. NVIDIA release notes)
+# CUDA:   12.4
+# cuBLAS: 12.4.5.8
+# cuDNN:  9.1.0.70
+# TRT:    8.6.3 в NGC-контейнере; в публичном CUDA apt repo без NGC доступен 8.6.1.6.
+ARG CUDA_META_VER="12.4.1-1"
+ARG CUBLAS_VER="12.4.5.8-1"
+ARG CUDNN_VER="9.1.0.70-1"
+ARG TRT_VER="8.6.1.6-1+cuda12.0"
 
 # Базовые зависимости для сборки (и чтобы build.py работал)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl gnupg2 lsb-release \
     build-essential git git-lfs \
     cmake ninja-build pkg-config \
-    python3 python3-dev python3-pip python3-venv \
+    # python3 python3-dev python3-pip python3-venv \
     patchelf \
     && rm -rf /var/lib/apt/lists/*
 
 # Подключаем NVIDIA CUDA apt repo (без NGC образов)
-# Для Ubuntu 24.04:
+# Triton 24.04 основан на Ubuntu 22.04 + CUDA 12.4.
 RUN curl -fsSL \
-      https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
+      https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
       -o /tmp/cuda-keyring.deb \
  && dpkg -i /tmp/cuda-keyring.deb \
  && rm -f /tmp/cuda-keyring.deb
 
-# Устанавливаем CUDA Toolkit 13.1 + cuBLAS/cuDNN/TensorRT (dev + runtime)
-# Замечание: версии пакетов могут иметь точные суффиксы в репозитории; при необходимости подправьте ARG-и выше.
+# Устанавливаем минимальный CUDA build stack + cuBLAS/cuDNN/TensorRT (dev + runtime).
+# Используем минимальный набор вместо полного cuda-toolkit, чтобы не тянуть лишние GUI/tools пакеты.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cuda-toolkit-13-1 \
-    cuda-cudart-dev-13-1 \
-    libcublas-13-1=${CUBLAS_VER} \
-    libcublas-dev-13-1=${CUBLAS_VER} \
-    libcudnn9-cuda-13=${CUDNN_VER} \
-    libcudnn9-dev-cuda-13=${CUDNN_VER} \
-    libnvinfer10=${TRT_VER} \
+    cuda-minimal-build-12-4=${CUDA_META_VER} \
+    cuda-libraries-12-4=${CUDA_META_VER} \
+    cuda-libraries-dev-12-4=${CUDA_META_VER} \
+    cuda-cudart-dev-12-4 \
+    cuda-cuobjdump-12-4 \
+    cuda-nvdisasm-12-4 \
+    cuda-cupti-dev-12-4 \
+    libcublas-12-4=${CUBLAS_VER} \
+    libcublas-dev-12-4=${CUBLAS_VER} \
+    libcudnn9-cuda-12=${CUDNN_VER} \
+    libcudnn9-dev-cuda-12=${CUDNN_VER} \
+    libnvinfer-headers-dev=${TRT_VER} \
+    libnvinfer8=${TRT_VER} \
     libnvinfer-dev=${TRT_VER} \
-    libnvinfer-plugin10=${TRT_VER} \
+    libnvinfer-headers-plugin-dev=${TRT_VER} \
+    libnvinfer-plugin8=${TRT_VER} \
     libnvinfer-plugin-dev=${TRT_VER} \
-    libnvonnxparsers10=${TRT_VER} \
+    libnvonnxparsers8=${TRT_VER} \
     libnvonnxparsers-dev=${TRT_VER} \
+    python3.11-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # Удобные переменные окружения (часто полезны при сборке)
@@ -52,7 +62,7 @@ ENV PATH="${CUDA_HOME}/bin:${PATH}"
 ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
 
 # Python deps, которые часто нужны сборочным скриптам Triton (в т.ч. distro)
-# Используем venv, чтобы не нарушать PEP 668 в Ubuntu 24.04.
+# Используем venv, чтобы не нарушать PEP 668.
 RUN python3 -m venv /opt/venv \
  && /opt/venv/bin/python -m pip install --no-cache-dir -U pip setuptools wheel \
  && /opt/venv/bin/python -m pip install --no-cache-dir \
