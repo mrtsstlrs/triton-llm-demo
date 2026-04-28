@@ -136,9 +136,9 @@ RUN git clone --depth=1 --single-branch -b r{triton_container_version} \\
 compat_re = re.compile(
     r"\n# Extra defensive wiring for CUDA Compat lib\n"
     r"RUN ln -sf \$\{_CUDA_COMPAT_PATH\}/lib\.real \$\{_CUDA_COMPAT_PATH\}/lib \\\n"
-    r"    && echo \$\{_CUDA_COMPAT_PATH\}/lib > /etc/ld\.so\.conf\.d/00-cuda-compat\.conf \\\n"
-    r"    && ldconfig \\\n"
-    r"    && rm -f \$\{_CUDA_COMPAT_PATH\}/lib\n",
+    r"\s+&& echo \$\{_CUDA_COMPAT_PATH\}/lib > /etc/ld\.so\.conf\.d/00-cuda-compat\.conf \\\n"
+    r"\s+&& ldconfig \\\n"
+    r"\s+&& rm -f \$\{_CUDA_COMPAT_PATH\}/lib\n",
 )
 
 dcgm_re = re.compile(
@@ -158,6 +158,11 @@ kitware_re = re.compile(
     r"      && apt-get update -q=2 \\\n"
     r"      && apt-get install -y --no-install-recommends cmake=3\.27\.7\* cmake-data=3\.27\.7\*",
 )
+
+astra_apt_tls_config = """# Astra repo OCSP responses can be rejected by apt inside intermediate containers.
+RUN printf '%s\\n' 'Acquire::https::download.astralinux.ru::Verify-Peer "false";' \\
+      > /etc/apt/apt.conf.d/99-astra-repo-tls
+"""
 
 text = buildbase.read_text()
 if docker_install not in text:
@@ -181,12 +186,31 @@ if third_party_arg not in text:
         f'"-DTRITON_THIRD_PARTY_REPO_TAG:STRING=r24.04" {third_party_arg} ',
         1,
     )
+python_backend_cxx_flags = '"-DCMAKE_CXX_FLAGS:STRING=-Wno-error=deprecated-declarations"'
+if python_backend_cxx_flags not in text:
+    text = text.replace(
+        '"-DTRITON_ENABLE_MEMORY_TRACKER:BOOL=ON" ..',
+        f'"-DTRITON_ENABLE_MEMORY_TRACKER:BOOL=ON" {python_backend_cxx_flags} ..',
+        1,
+    )
 cmake_build.write_text(text)
 
 text = runtime.read_text()
+if "99-astra-repo-tls" not in text:
+    text = text.replace("FROM ${BASE_IMAGE}\n", f"FROM ${{BASE_IMAGE}}\n\n{astra_apt_tls_config}", 1)
 text = dcgm_re.sub(dcgm_block, text)
 text = compat_re.sub("\n", text)
-text = text.replace("pip3 install vllm==0.11.1", f"pip3 install vllm=={vllm_version}")
+text = text.replace("pip3 install --upgrade \\\n            wheel \\\n            setuptools \\\n            numpy \\\n            virtualenv", "pip3 install --upgrade \\\n            wheel \\\n            setuptools \\\n            'numpy<2' \\\n            virtualenv")
+text = text.replace(
+    "pip3 install vllm==0.11.1",
+    "pip3 install \\\n"
+    "      'numpy<2' \\\n"
+    "      'protobuf<5' \\\n"
+    "      'huggingface-hub<1' \\\n"
+    "      'tokenizers<0.20' \\\n"
+    "      'transformers==4.39.3' \\\n"
+    f"      vllm=={vllm_version}",
+)
 text = text.replace("ARG PYVER=3.12", "ARG PYVER=3.11")
 runtime.write_text(text)
 PY
