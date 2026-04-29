@@ -1,3 +1,5 @@
 hf_cache
 hf_home
 *.env
+.codex
+*__pycache__

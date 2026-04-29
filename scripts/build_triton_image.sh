@@ -7,27 +7,58 @@ TRITON_VERSION="${TRITON_VERSION:-2.45.0}"
 UPSTREAM_CONTAINER_VERSION="${UPSTREAM_CONTAINER_VERSION:-24.04}"
 DCGM_VERSION="${DCGM_VERSION:-3.2.6}"
 VLLM_VERSION="${VLLM_VERSION:-0.4.0.post1}"
+TRITON_SERVER_REPO="${TRITON_SERVER_REPO:-https://github.com/triton-inference-server/server.git}"
+TRITON_SERVER_DIR="${TRITON_SERVER_DIR:-${ROOT_DIR}/server}"
+TRITON_SERVER_REF="${TRITON_SERVER_REF:-r${TRITON_CONTAINER_VERSION}}"
 BASE_IMAGE="${BASE_IMAGE:-triton-base:${TRITON_CONTAINER_VERSION}}"
-BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/server/build}"
-if [[ -z "${PYTHON:-}" ]]; then
-  if [[ -x "${ROOT_DIR}/server/.venv/bin/python" ]]; then
-    PYTHON="${ROOT_DIR}/server/.venv/bin/python"
-  else
-    PYTHON="python3"
-  fi
-fi
+BUILD_DIR="${BUILD_DIR:-${TRITON_SERVER_DIR}/build}"
 
-SERVER_VERSION="$(tr -d '[:space:]' < "${ROOT_DIR}/server/TRITON_VERSION")"
-if [[ "${ALLOW_TRITON_VERSION_MISMATCH:-0}" != "1" && "${SERVER_VERSION}" != "${TRITON_VERSION}" ]]; then
-  cat >&2 <<EOF
-server/TRITON_VERSION is ${SERVER_VERSION}, but this script is configured for ${TRITON_VERSION}.
-Checkout the Triton ${TRITON_CONTAINER_VERSION} sources first, for example:
-  git -C "${ROOT_DIR}/server" fetch --tags origin
-  git -C "${ROOT_DIR}/server" checkout r${TRITON_CONTAINER_VERSION}
+ensure_triton_server_sources() {
+  if [[ ! -e "${TRITON_SERVER_DIR}" ]]; then
+    echo "Cloning Triton server sources: ${TRITON_SERVER_REPO} (${TRITON_SERVER_REF})"
+    git clone --branch "${TRITON_SERVER_REF}" --single-branch "${TRITON_SERVER_REPO}" "${TRITON_SERVER_DIR}"
+  elif [[ ! -d "${TRITON_SERVER_DIR}/.git" ]]; then
+    cat >&2 <<EOF
+${TRITON_SERVER_DIR} already exists but is not a git checkout.
+Remove it or set TRITON_SERVER_DIR to another path.
+EOF
+    exit 1
+  else
+    echo "Using existing Triton server sources: ${TRITON_SERVER_DIR}"
+  fi
+
+  if [[ ! -f "${TRITON_SERVER_DIR}/TRITON_VERSION" ]]; then
+    cat >&2 <<EOF
+${TRITON_SERVER_DIR}/TRITON_VERSION not found.
+Check that TRITON_SERVER_DIR points to a Triton server checkout.
+EOF
+    exit 1
+  fi
+
+  SERVER_VERSION="$(tr -d '[:space:]' < "${TRITON_SERVER_DIR}/TRITON_VERSION")"
+  if [[ "${ALLOW_TRITON_VERSION_MISMATCH:-0}" != "1" && "${SERVER_VERSION}" != "${TRITON_VERSION}" ]]; then
+    cat >&2 <<EOF
+${TRITON_SERVER_DIR}/TRITON_VERSION is ${SERVER_VERSION}, but this script is configured for ${TRITON_VERSION}.
+Expected source ref is ${TRITON_SERVER_REF}.
+
+If this is an existing checkout, switch it manually, for example:
+  git -C "${TRITON_SERVER_DIR}" fetch --tags origin
+  git -C "${TRITON_SERVER_DIR}" checkout "${TRITON_SERVER_REF}"
 
 Set ALLOW_TRITON_VERSION_MISMATCH=1 only if you intentionally want a mixed source/dependency build.
 EOF
-  exit 1
+    exit 1
+  fi
+}
+
+ensure_triton_server_sources
+
+if [[ -z "${PYTHON:-}" ]]; then
+  if [[ -x "${TRITON_SERVER_DIR}/.venv/bin/python" ]]; then
+    PYTHON="${TRITON_SERVER_DIR}/.venv/bin/python"
+  else
+    PYTHON="python3"
+  fi
 fi
 
 patch_generated_dockerfiles() {
@@ -221,7 +252,7 @@ docker build -t "${BASE_IMAGE}" -f "${ROOT_DIR}/Dockerfile.base" "${ROOT_DIR}"
 
 echo "Building Triton image with metrics + vLLM backend"
 (
-  cd "${ROOT_DIR}/server"
+  cd "${TRITON_SERVER_DIR}"
   "${PYTHON}" ./build.py \
     --dryrun \
     --no-container-pull \
