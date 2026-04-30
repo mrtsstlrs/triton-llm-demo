@@ -24,6 +24,7 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_6
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cuda-cudart-12-4 \
     datacenter-gpu-manager \
+    libxml2 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /models
@@ -41,10 +42,6 @@ COPY --from=triton /usr/lib/python3.10 /usr/lib/python3.10
 COPY --from=triton /usr/local/lib/python3.10 /usr/local/lib/python3.10
 
 RUN ln -sfn /usr/local/cuda-12.4 /usr/local/cuda
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libxml2 \
-    && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/opt/tritonserver/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/opt/tritonserver/lib:/opt/tritonserver/backends/onnxruntime:/opt/hpcx/ucc/lib:/opt/hpcx/ucx/lib:/opt/hpcx/ompi/lib:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu"
