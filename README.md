@@ -1,248 +1,408 @@
-# Сборка Triton Server 24.04 из Astra Linux base image
+# Triton Server на Astra Linux
 
-Этот репозиторий содержит wrapper-сборку Triton Inference Server `2.45.0` / `r24.04` из базового образа Astra:
+`Dockerfile.astra-py310-shim` собирает целевой runtime-образ Triton Server на базе Astra Linux.
 
-```text
-registry.astralinux.ru/library/astra/ubi18-python311:1.8.5
-```
-
-Цель сборки: получить локальный образ `tritonserver:latest` без использования `nvcr.io` / NGC container images и без auth в инфраструктуру NVIDIA. Публичные apt-репозитории NVIDIA CUDA используются для CUDA/cuBLAS/cuDNN/TensorRT пакетов.
-
-## Почему не один Dockerfile
-
-Упаковать весь процесс в один Dockerfile технически возможно только не-best-practice способом: запускать Docker-in-Docker внутри build stage или полностью переписать upstream Triton `server/build.py` flow. Это плохо воспроизводится, требует privileged-доступа к Docker daemon и усложняет аудит.
-
-Текущий процесс сознательно разделен на две фазы:
-
-1. `Dockerfile.base` собирает pinованный base image `triton-base:24.04` на базе Astra Linux с CUDA/cuBLAS/cuDNN/TensorRT и Python build deps.
-2. `scripts/build_triton_image.sh` клонирует Triton Server source tree при необходимости, запускает upstream `server/build.py --dryrun`, получает generated Dockerfile'ы Triton, применяет Astra-совместимые патчи и запускает generated `server/build/docker_build`.
-
-Практически это эквивалентно двум Dockerfile-фазам, но без vendoring generated Dockerfile'ов из Triton. Это снижает drift относительно upstream `r24.04`: при смене Triton tag generated Dockerfile'ы снова создаются upstream-скриптом, а wrapper явно валидирует версию.
-
-## Требования
-
-- Docker с поддержкой BuildKit.
-- NVIDIA Container Toolkit на host, если нужно запускать GPU inference.
-- Доступ к интернету на время сборки:
-  - `registry.astralinux.ru` для Astra base image.
-  - `developer.download.nvidia.com` для публичных CUDA/cuDNN/TensorRT apt packages.
-  - `github.com` для Triton component repositories.
-  - `download.docker.com` не используется wrapper'ом после патча generated Dockerfile.
-
-## Подготовка Triton source tree
-
-Ручное клонирование не требуется. Если директория `server/` отсутствует, `scripts/build_triton_image.sh` сам выполнит:
-
-```bash
-git clone --branch r24.04 --single-branch \
-  https://github.com/triton-inference-server/server.git \
-  server
-```
-
-Если `server/` уже существует, wrapper использует существующий checkout и не делает auto-checkout, чтобы не затирать локальные изменения. В этом случае он только проверяет `server/TRITON_VERSION` и ожидает `2.45.0`.
-
-Source location и ref можно переопределить:
-
-- `TRITON_SERVER_REPO`, по умолчанию `https://github.com/triton-inference-server/server.git`.
-- `TRITON_SERVER_DIR`, по умолчанию `<repo-root>/server`.
-- `TRITON_SERVER_REF`, по умолчанию `r24.04`.
-
-## Основная команда сборки
-
-```bash
-./scripts/build_triton_image.sh
-```
-
-Результат:
+Итоговый образ:
 
 ```text
-triton-base:24.04
-tritonserver:latest
+tritonserver:24.04-astra-shim
 ```
 
-Основные параметры можно переопределить через environment variables:
-
-```bash
-TRITON_CONTAINER_VERSION=24.04 \
-TRITON_VERSION=2.45.0 \
-UPSTREAM_CONTAINER_VERSION=24.04 \
-DCGM_VERSION=3.2.6 \
-VLLM_VERSION=0.4.0.post1 \
-TRITON_SERVER_REPO=https://github.com/triton-inference-server/server.git \
-TRITON_SERVER_DIR="$PWD/server" \
-TRITON_SERVER_REF=r24.04 \
-BASE_IMAGE=triton-base:24.04 \
-BUILD_DIR="$PWD/server/build" \
-./scripts/build_triton_image.sh
-```
-
-`ALLOW_TRITON_VERSION_MISMATCH=1` существует только для осознанной диагностики mixed source/dependency build. Для production-сборки его использовать не нужно.
-
-## Что делает `Dockerfile.base`
-
-`Dockerfile.base`:
-
-- Берет базу `registry.astralinux.ru/library/astra/ubi18-python311:1.8.5`.
-- Устанавливает build deps: `build-essential`, `git`, `git-lfs`, `cmake`, `ninja-build`, `pkg-config`, `patchelf`, Python venv deps.
-- Подключает публичный NVIDIA CUDA apt repo для Ubuntu 22.04.
-- Устанавливает CUDA stack для Triton 24.04:
-  - CUDA `12.4`.
-  - cuBLAS `12.4.5.8-1`.
-  - cuDNN `9.1.0.70-1`.
-  - TensorRT `8.6.1.6-1+cuda12.0`.
-- Создает `/opt/venv` и устанавливает Python build helpers: `distro`, `packaging`, `requests`, `pyyaml`.
-
-TensorRT версия отличается от NGC runtime для Triton 24.04: в NGC используется TensorRT `8.6.3`, но без NGC auth из публичного CUDA apt repo доступен `8.6.1.6`.
-
-## Что делает `scripts/build_triton_image.sh`
-
-Скрипт выполняет сборку end-to-end:
-
-1. Определяет корень репозитория, версии Triton/CUDA-related компонентов и build directory.
-2. Проверяет наличие `TRITON_SERVER_DIR`.
-3. Если `TRITON_SERVER_DIR` отсутствует, клонирует `TRITON_SERVER_REPO` на ref `TRITON_SERVER_REF`.
-4. Если `TRITON_SERVER_DIR` уже существует, использует его как есть и не меняет branch/ref.
-5. Проверяет `server/TRITON_VERSION`. По умолчанию сборка останавливается, если source tree не соответствует `TRITON_VERSION=2.45.0`.
-6. Собирает base image:
-
-```bash
-docker build -t triton-base:24.04 -f Dockerfile.base .
-```
-
-7. Переходит в `server/` и запускает upstream Triton build generator в dry-run режиме:
-
-```bash
-python ./build.py \
-  --dryrun \
-  --no-container-pull \
-  --no-container-interactive \
-  --version 2.45.0 \
-  --container-version 24.04 \
-  --upstream-container-version 24.04 \
-  --image base,triton-base:24.04 \
-  --target-platform linux \
-  --target-machine x86_64 \
-  --backend python \
-  --backend vllm \
-  --backend ensemble \
-  --endpoint http \
-  --endpoint grpc \
-  --enable-logging \
-  --enable-stats \
-  --enable-metrics \
-  --enable-gpu-metrics \
-  --enable-cpu-metrics \
-  --enable-gpu
-```
-
-`--dryrun` важен: upstream `build.py` только генерирует `server/build/*`, но не начинает сборку сразу. Это дает wrapper'у возможность пропатчить generated Dockerfile'ы до запуска Docker build.
-
-8. Применяет патчи к generated файлам в `server/build/`.
-9. Запускает generated script:
-
-```bash
-server/build/docker_build
-```
-
-## Патчи generated Dockerfile'ов
-
-Wrapper не меняет upstream source files в `server/`. Все изменения применяются только к generated build artifacts в `server/build/`.
-
-Применяемые изменения:
-
-- `Dockerfile.buildbase`: установка Docker CLI берется из Astra repo через `docker.io`. Это заменяет upstream block с `download.docker.com/linux/ubuntu`, который ломается на Astra codename `1.8_x86-64`.
-- `Dockerfile.buildbase`: Kitware apt repo заменен на `pip3 install cmake==3.27.7`, потому что upstream Ubuntu codename logic неприменим к Astra.
-- `Dockerfile.buildbase` и runtime `Dockerfile`: DCGM ставится как публичный apt package `datacenter-gpu-manager=1:3.2.6`.
-- `Dockerfile.buildbase`: клонируется `triton-inference-server/third_party` tag `r24.04` в `/opt/triton-third-party`.
-- `third_party`: для libevent отключаются samples/benchmarks/tests/regress, а проблемный `arc4random_addrandom` участок патчится для совместимости с Astra/glibc.
-- `cmake_build`: добавляется `-DFETCHCONTENT_SOURCE_DIR_REPO-THIRD-PARTY=/opt/triton-third-party`, чтобы использовать пропатченный локальный `third_party`.
-- `cmake_build`: для Python backend добавляется `-DCMAKE_CXX_FLAGS=-Wno-error=deprecated-declarations`. Это нужно из-за Boost `1.79` и GCC 12, где `std::unary_function` deprecated warning иначе превращается в error.
-- Runtime `Dockerfile`: добавляется apt config для Astra repo TLS issue внутри intermediate containers:
+Dockerfile использует:
 
 ```text
-Acquire::https::download.astralinux.ru::Verify-Peer "false";
+FROM nvcr.io/nvidia/tritonserver:24.04-py3 AS triton
+FROM registry.astralinux.ru/library/astra/ubi18:1.8.5
 ```
 
-Это workaround для build environment. Для production hardening лучше заменить его на корректную установку доверенного CA/OCSP цепочки, если это возможно в целевой инфраструктуре.
+В Astra runtime переносятся:
 
-- Runtime `Dockerfile`: удаляется upstream CUDA Compat symlink block, который некорректен для текущего Astra/CUDA layout.
-- Runtime `Dockerfile`: Python runtime фиксируется на `PYVER=3.11`, чтобы соответствовать base image.
-- Runtime `Dockerfile`: pin'ятся Python dependencies для vLLM backend:
-  - `numpy<2`
-  - `protobuf<5`
-  - `huggingface-hub<1`
-  - `tokenizers<0.20`
-  - `transformers==4.39.3`
-  - `vllm==0.4.0.post1`
+- `/opt/tritonserver`
+- Python 3.10 runtime, нужный Python backend'у Triton 24.04
+- CUDA 12.4 runtime libraries
+- cuDNN / NCCL / TensorRT runtime libraries
+- HPCX UCX/UCC/OpenMPI libraries
 
-Эти pins нужны для совместимости Triton 24.04 vLLM backend с Python 3.11 и текущим dependency graph.
+Образ запускает Triton Server `2.45.0` / release `24.04` на Astra runtime. Проверенные backend'ы: `onnxruntime`, `pytorch`, `python`.
 
-## Проверка результата
-
-Проверить, что image собран:
+Сборка:
 
 ```bash
-docker image ls triton-base:24.04 tritonserver:latest
+docker build \
+  -t tritonserver:24.04-astra-shim \
+  -f Dockerfile.astra-py310-shim \
+  .
 ```
 
-Минимальная проверка Python/vLLM packages:
+Проверить backend libraries:
 
 ```bash
-docker run --rm --entrypoint /bin/bash tritonserver:latest -c \
-  '/opt/venv/bin/python -c "import numpy, transformers, torch, vllm; print(numpy.__version__); print(transformers.__version__); print(torch.__version__); print(vllm.__version__)"'
+docker run --rm --entrypoint /bin/bash tritonserver:24.04-astra-shim -lc \
+  'find /opt/tritonserver/backends -maxdepth 2 -type f -name "libtriton_*.so" -printf "%h/%f\n" | sort'
 ```
 
-Ожидаемые версии для текущей сборки:
+Для `onnxruntime` и `pytorch` также полезно проверить, что нет незакрытых dynamic dependencies:
+
+```bash
+docker run --rm --entrypoint /bin/bash tritonserver:24.04-astra-shim -lc \
+  'ldd /opt/tritonserver/backends/onnxruntime/libtriton_onnxruntime.so | grep "not found" || true'
+
+docker run --rm --entrypoint /bin/bash tritonserver:24.04-astra-shim -lc \
+  'ldd /opt/tritonserver/backends/pytorch/libtriton_pytorch.so | grep "not found" || true'
+```
+
+## Тестовые модели
+
+`model_repository/` содержит тестовые модели для проверки backend'ов и Triton API.
+
+### `onnx_add`
+
+Backend: `onnxruntime`.
+
+Файлы:
 
 ```text
-numpy 1.26.4
-transformers 4.39.3
-torch 2.1.2+cu121
-vllm 0.4.0.post1
+model_repository/onnx_add/config.pbtxt
+model_repository/onnx_add/1/model.onnx
 ```
 
-Запуск Triton с model repository:
+Контракт:
+
+- `INPUT0`: `FP32`, shape `[1, 4]`
+- `INPUT1`: `FP32`, shape `[1, 4]`
+- `OUTPUT0`: `FP32`, shape `[1, 4]`
+- операция: `OUTPUT0 = INPUT0 + INPUT1`
+
+### `pytorch_addsub`
+
+Backend: `pytorch`.
+
+Файлы:
+
+```text
+model_repository/pytorch_addsub/config.pbtxt
+model_repository/pytorch_addsub/1/model.pt
+```
+
+Контракт:
+
+- `INPUT0`: `FP32`, shape `[4]`
+- `INPUT1`: `FP32`, shape `[4]`
+- `OUTPUT0`: `FP32`, shape `[4]`
+- `OUTPUT1`: `FP32`, shape `[4]`
+- операции:
+  - `OUTPUT0 = INPUT0 + INPUT1`
+  - `OUTPUT1 = INPUT0 - INPUT1`
+
+### `pytorch_addsub_batch`
+
+Backend: `pytorch`.
+
+Это batched-вариант `pytorch_addsub` для проверки dynamic batching.
+
+Файлы:
+
+```text
+model_repository/pytorch_addsub_batch/config.pbtxt
+model_repository/pytorch_addsub_batch/1/model.pt
+```
+
+Настройки:
+
+- `max_batch_size: 8`
+- `dynamic_batching`
+- `preferred_batch_size: [2, 4, 8]`
+
+Контракт одного элемента batch такой же, как у `pytorch_addsub`: два входа `FP32 [4]`, два выхода `FP32 [4]`. В HTTP request shape включает batch dimension, например `[2, 4]`.
+
+### `python_model`
+
+Backend: `python`.
+
+Echo-модель для проверки Python backend и custom metrics.
+
+Контракт:
+
+- `INPUT`: `BYTES`, shape `[1]`
+- `OUTPUT`: `BYTES`, shape `[1]`
+- операция: возвращает строку `echo: <INPUT>`
+
+### Нерабочие/отложенные модели
+
+- `vllm_model`: в `24.04-py3` нет backend `vllm`, поэтому эта модель не должна загружаться в текущем образе.
+- `tensorrt_add`: содержит ONNX-заготовку и config для TensorRT, но `.plan` не создан. TensorRT `8.6.3` из Triton 24.04 не смог собрать engine на GPU с `sm_120`.
+
+## Запуск Triton Server
+
+Рекомендуемый режим запуска для текущего `model_repository` - `MODE_EXPLICIT`, чтобы загружать только нужные модели:
 
 ```bash
-docker run --rm --gpus all --name triton-smoke \
+docker run --rm --gpus all --name triton \
   -v "$PWD/model_repository:/models:ro" \
   -p 8000:8000 -p 8001:8001 -p 8002:8002 \
-  --entrypoint /opt/tritonserver/bin/tritonserver \
-  tritonserver:latest \
-  --model-repository=/models
+  tritonserver:24.04-astra-shim \
+  tritonserver --model-repository=/models \
+  --model-control-mode=explicit \
+  --load-model=onnx_add \
+  --load-model=pytorch_addsub
 ```
 
-Readiness:
+Для batch-теста модель можно загрузить сразу:
 
 ```bash
+docker run --rm --gpus all --name triton \
+  -v "$PWD/model_repository:/models:ro" \
+  -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+  tritonserver:24.04-astra-shim \
+  tritonserver --model-repository=/models \
+  --model-control-mode=explicit \
+  --load-model=onnx_add \
+  --load-model=pytorch_addsub \
+  --load-model=pytorch_addsub_batch
+```
+
+Если опубликованные Docker порты недоступны из host-среды, выполняйте HTTP-проверки внутри контейнера:
+
+```bash
+docker exec triton curl -s http://127.0.0.1:8000/v2/health/ready
+```
+
+## Проверка Triton API
+
+Health:
+
+```bash
+curl -i http://127.0.0.1:8000/v2/health/live
 curl -i http://127.0.0.1:8000/v2/health/ready
-curl -i http://127.0.0.1:8000/v2/models/python_model/ready
 ```
 
-Если host-среда изолирует опубликованные Docker ports, проверку можно выполнить внутри контейнера:
+Model readiness:
 
 ```bash
-docker exec triton-smoke curl -i http://127.0.0.1:8000/v2/health/ready
+curl -i http://127.0.0.1:8000/v2/models/onnx_add/ready
+curl -i http://127.0.0.1:8000/v2/models/pytorch_addsub/ready
+```
+
+ONNX HTTP inference:
+
+```bash
+curl -s http://127.0.0.1:8000/v2/models/onnx_add/infer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "inputs": [
+      {
+        "name": "INPUT0",
+        "shape": [1, 4],
+        "datatype": "FP32",
+        "data": [[1, 2, 3, 4]]
+      },
+      {
+        "name": "INPUT1",
+        "shape": [1, 4],
+        "datatype": "FP32",
+        "data": [[10, 20, 30, 40]]
+      }
+    ],
+    "outputs": [
+      { "name": "OUTPUT0" }
+    ]
+  }' | jq
+```
+
+Ожидаемый `OUTPUT0`:
+
+```text
+[11.0, 22.0, 33.0, 44.0]
+```
+
+PyTorch HTTP inference:
+
+```bash
+curl -s http://127.0.0.1:8000/v2/models/pytorch_addsub/infer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "inputs": [
+      {
+        "name": "INPUT0",
+        "shape": [4],
+        "datatype": "FP32",
+        "data": [1, 2, 3, 4]
+      },
+      {
+        "name": "INPUT1",
+        "shape": [4],
+        "datatype": "FP32",
+        "data": [10, 20, 30, 40]
+      }
+    ],
+    "outputs": [
+      { "name": "OUTPUT0" },
+      { "name": "OUTPUT1" }
+    ]
+  }' | jq
+```
+
+Ожидаемые значения:
+
+```text
+OUTPUT0 = [11.0, 22.0, 33.0, 44.0]
+OUTPUT1 = [-9.0, -18.0, -27.0, -36.0]
+```
+
+Python echo inference:
+
+```bash
+curl -s http://127.0.0.1:8000/v2/repository/models/python_model/load -X POST
+
+curl -s http://127.0.0.1:8000/v2/models/python_model/infer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "inputs": [
+      {
+        "name": "INPUT",
+        "shape": [1],
+        "datatype": "BYTES",
+        "data": ["hello from triton"]
+      }
+    ],
+    "outputs": [
+      { "name": "OUTPUT" }
+    ]
+  }' | jq
+```
+
+Ожидаемый `OUTPUT`:
+
+```text
+echo: hello from triton
+```
+
+Batch inference:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/v2/repository/models/pytorch_addsub_batch/load
+
+curl -s http://127.0.0.1:8000/v2/models/pytorch_addsub_batch/infer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "inputs": [
+      {
+        "name": "INPUT0",
+        "shape": [2, 4],
+        "datatype": "FP32",
+        "data": [[1, 2, 3, 4], [5, 6, 7, 8]]
+      },
+      {
+        "name": "INPUT1",
+        "shape": [2, 4],
+        "datatype": "FP32",
+        "data": [[10, 20, 30, 40], [1, 1, 1, 1]]
+      }
+    ],
+    "outputs": [
+      { "name": "OUTPUT0" },
+      { "name": "OUTPUT1" }
+    ]
+  }' | jq
+```
+
+Ожидаемые значения:
+
+```text
+OUTPUT0 = [[11.0, 22.0, 33.0, 44.0], [6.0, 7.0, 8.0, 9.0]]
+OUTPUT1 = [[-9.0, -18.0, -27.0, -36.0], [4.0, 5.0, 6.0, 7.0]]
+```
+
+Batch stats:
+
+```bash
+curl -s http://127.0.0.1:8000/v2/models/pytorch_addsub_batch/stats | jq
+```
+
+В ответе должен появиться `batch_stats` с `batch_size: 2`.
+
+Metrics:
+
+```bash
+curl -s http://127.0.0.1:8002/metrics | grep -E \
+  'nv_inference_count|nv_inference_request_success|nv_gpu_utilization|nv_gpu_memory_used_bytes'
+```
+
+Repository load/unload:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/v2/repository/models/onnx_add/unload
+curl -i http://127.0.0.1:8000/v2/models/onnx_add/ready
+
+curl -s -X POST http://127.0.0.1:8000/v2/repository/models/onnx_add/load
+curl -i http://127.0.0.1:8000/v2/models/onnx_add/ready
+```
+
+Repository index:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/v2/repository/index | jq
+```
+
+gRPC-тест через SDK image:
+
+```bash
+docker run -i --rm --network container:triton \
+  --entrypoint python3 \
+  nvcr.io/nvidia/tritonserver:24.04-py3-sdk - <<'PY'
+import numpy as np
+import tritonclient.grpc as grpcclient
+
+client = grpcclient.InferenceServerClient(url="127.0.0.1:8001")
+print("live", client.is_server_live())
+print("ready", client.is_server_ready())
+print("onnx_ready", client.is_model_ready("onnx_add"))
+
+x = np.array([[1, 2, 3, 4]], dtype=np.float32)
+y = np.array([[10, 20, 30, 40]], dtype=np.float32)
+
+inputs = [
+    grpcclient.InferInput("INPUT0", x.shape, "FP32"),
+    grpcclient.InferInput("INPUT1", y.shape, "FP32"),
+]
+inputs[0].set_data_from_numpy(x)
+inputs[1].set_data_from_numpy(y)
+
+result = client.infer(
+    "onnx_add",
+    inputs=inputs,
+    outputs=[grpcclient.InferRequestedOutput("OUTPUT0")],
+)
+print(result.as_numpy("OUTPUT0").tolist())
+PY
+```
+
+Ожидаемый вывод:
+
+```text
+live True
+ready True
+onnx_ready True
+[[11.0, 22.0, 33.0, 44.0]]
 ```
 
 ## Известные ограничения
 
 - Текущий vLLM stack `vllm==0.4.0.post1` подтягивает `torch 2.1.2+cu121`. Он не поддерживает RTX 5070 / CUDA capability `sm_120`.
-- На RTX 5070 `vllm_model` падает с:
+- На GPU с `sm_120` `vllm_model` падает с:
 
 ```text
 RuntimeError: CUDA error: no kernel image is available for execution on the device
 ```
 
-- Для RTX 5070 нужен другой PyTorch/vLLM/CUDA stack с поддержкой `sm_120` или сборка соответствующих CUDA extensions под эту архитектуру.
-- `python_model` из `model_repository` сейчас является smoke-test моделью загрузки backend: она создает custom metric, но не определяет input/output контракт и не предназначена для полноценного inference request.
+- Для GPU с `sm_120` нужен другой PyTorch/vLLM/CUDA stack с поддержкой `sm_120` или сборка соответствующих CUDA extensions под эту архитектуру.
+- `python_model` из `model_repository` является тестовой моделью Python backend: она создает custom metric и отвечает echo-строкой на `BYTES` input.
+- `Dockerfile.astra-py310-shim` использует `nvcr.io/nvidia/tritonserver:24.04-py3` как source stage для переноса Triton Server и согласованных runtime-библиотек в Astra image.
+- TensorRT backend в образе присутствует, но на `sm_120` TensorRT `8.6.3` из Triton 24.04 не смог собрать тестовый engine через `trtexec`.
 
 ## Безопасность и воспроизводимость
 
-- Сборка не использует `nvcr.io` images и не требует NGC auth.
-- Upstream source tree автоматически клонируется на `r24.04`, если `server/` отсутствует.
-- Если `server/` уже существует, wrapper не выполняет destructive checkout и только валидирует `TRITON_VERSION`.
-- Base dependency versions заданы явно в `Dockerfile.base`.
-- Generated Dockerfile patches находятся в одном месте: `scripts/build_triton_image.sh`.
-- Wrapper не модифицирует upstream `server/` source tree.
-- Workaround `Verify-Peer "false"` для Astra apt repo нужно рассматривать как технический долг и заменить на корректную CA/OCSP настройку перед production hardening.
+- Образ собирается из явно заданных base images: `nvcr.io/nvidia/tritonserver:24.04-py3` и `registry.astralinux.ru/library/astra/ubi18:1.8.5`.
+- Runtime-зависимости Triton берутся из того же NGC release image, что снижает риск несовместимости версий backend'ов и системных библиотек.
+- `model_repository` содержит как рабочие тестовые модели, так и отложенные заготовки. Для штатного запуска используйте `--model-control-mode=explicit` и перечисляйте модели через `--load-model`.
+- Для production hardening отдельно проверьте политику обновления base images, сканирование уязвимостей, доступ к NGC/Astra registry, лимиты контейнера и внешний слой auth/TLS.
