@@ -1,6 +1,6 @@
 FROM nvcr.io/nvidia/tritonserver:24.02-py3 AS triton
 
-FROM registry.astralinux.ru/library/astra/ubi18-python311:1.8.5
+FROM registry.astralinux.ru/library/astra/ubi18-python310:1.8.5
 
 ENV DEBIAN_FRONTEND=noninteractive
 

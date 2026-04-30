@@ -1,0 +1,55 @@
+FROM nvcr.io/nvidia/tritonserver:24.04-py3 AS triton
+
+FROM registry.astralinux.ru/library/astra/ubi18:1.8.5
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libb64-0d \
+    libexpat1 \
+    libglib2.0-0 \
+    libgomp1 \
+    libnuma1 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb \
+    && dpkg -i cuda-keyring_1.1-1_all.deb \
+    && rm -f cuda-keyring_1.1-1_all.deb
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cuda-cudart-12-4 \
+    datacenter-gpu-manager \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /models
+
+COPY --from=triton /opt/tritonserver /opt/tritonserver
+COPY --from=triton /opt/hpcx /opt/hpcx
+COPY --from=triton /usr/local/cuda-12.4 /usr/local/cuda-12.4
+COPY --from=triton /usr/lib/x86_64-linux-gnu/libarchive.so.13* /usr/lib/x86_64-linux-gnu/
+COPY --from=triton /usr/lib/x86_64-linux-gnu/libpython3.10.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=triton /usr/lib/x86_64-linux-gnu/libcudnn* /usr/lib/x86_64-linux-gnu/
+COPY --from=triton /usr/lib/x86_64-linux-gnu/libnccl* /usr/lib/x86_64-linux-gnu/
+COPY --from=triton /usr/lib/x86_64-linux-gnu/libnvinfer* /usr/lib/x86_64-linux-gnu/
+COPY --from=triton /usr/lib/x86_64-linux-gnu/libnvonnxparser* /usr/lib/x86_64-linux-gnu/
+COPY --from=triton /usr/lib/python3.10 /usr/lib/python3.10
+COPY --from=triton /usr/local/lib/python3.10 /usr/local/lib/python3.10
+
+RUN ln -sfn /usr/local/cuda-12.4 /usr/local/cuda
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libxml2 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/opt/tritonserver/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/tritonserver/lib:/opt/tritonserver/backends/onnxruntime:/opt/hpcx/ucc/lib:/opt/hpcx/ucx/lib:/opt/hpcx/ompi/lib:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu"
+ENV PYTHONPATH="/usr/local/lib/python3.10/dist-packages"
+
+EXPOSE 8000 8001 8002
+
+CMD ["tritonserver", "--model-repository=/models"]
