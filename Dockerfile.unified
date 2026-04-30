@@ -22,12 +22,15 @@ ARG VLLM_VERSION=0.4.0.post1
 
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
-# Astra repo OCSP responses can be rejected by apt inside intermediate
-# containers. Prefer replacing this with proper CA/OCSP configuration for
-# hardened production builds.
+# Some Astra repository TLS/OCSP checks fail inside Docker build layers even
+# when the host can use the repository. This is a build workaround, not a
+# security hardening choice; production images should use proper CA/OCSP setup.
 RUN printf '%s\n' 'Acquire::https::download.astralinux.ru::Verify-Peer "false";' \
       > /etc/apt/apt.conf.d/99-astra-repo-tls
 
+# Base OS tools and runtime libraries shared by the builder and final image.
+# Python stays in runtime because the Python/vLLM backends execute inside the
+# same virtualenv that is created below.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
@@ -43,6 +46,7 @@ RUN apt-get update \
       libjemalloc-dev \
       libnuma-dev \
       libpython3-dev \
+      libgomp1 \
       libre2-9 \
       lsb-release \
       python3 \
@@ -52,12 +56,16 @@ RUN apt-get update \
       wget \
  && rm -rf /var/lib/apt/lists/*
 
+# Register NVIDIA's public CUDA apt repository. This replaces NGC base images
+# with ordinary apt packages for CUDA/cuBLAS/cuDNN/TensorRT/DCGM.
 RUN curl -fsSL \
       https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
       -o /tmp/cuda-keyring.deb \
  && dpkg -i /tmp/cuda-keyring.deb \
  && rm -f /tmp/cuda-keyring.deb
 
+# Runtime GPU libraries needed by Triton itself and by the enabled backends.
+# Version pins keep the image reproducible across apt repository updates.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       cuda-libraries-12-4=${CUDA_META_VER} \
@@ -70,9 +78,13 @@ RUN apt-get update \
       datacenter-gpu-manager=1:${DCGM_VERSION} \
  && rm -rf /var/lib/apt/lists/*
 
+# PyTorch/vLLM wheels install part of their CUDA dependency stack under
+# site-packages/nvidia, not under /usr/local/cuda. Keep those paths visible for
+# both build-time linking and runtime backend loading.
 ENV CUDA_HOME=/usr/local/cuda
+ENV PYTHON_SITE_PACKAGES=/opt/venv/lib/python3.11/site-packages
 ENV PATH=/opt/tritonserver/bin:/opt/venv/bin:${CUDA_HOME}/bin:${PATH}
-ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64
+ENV LD_LIBRARY_PATH=${PYTHON_SITE_PACKAGES}/torch/lib:${PYTHON_SITE_PACKAGES}/nvidia/cublas/lib:${PYTHON_SITE_PACKAGES}/nvidia/cuda_cupti/lib:${PYTHON_SITE_PACKAGES}/nvidia/cuda_nvrtc/lib:${PYTHON_SITE_PACKAGES}/nvidia/cuda_runtime/lib:${PYTHON_SITE_PACKAGES}/nvidia/cudnn/lib:${PYTHON_SITE_PACKAGES}/nvidia/cufft/lib:${PYTHON_SITE_PACKAGES}/nvidia/curand/lib:${PYTHON_SITE_PACKAGES}/nvidia/cusolver/lib:${PYTHON_SITE_PACKAGES}/nvidia/cusparse/lib:${PYTHON_SITE_PACKAGES}/nvidia/nccl/lib:${PYTHON_SITE_PACKAGES}/nvidia/nvtx/lib:${CUDA_HOME}/lib64
 ENV TRITON_SERVER_VERSION=${TRITON_VERSION}
 ENV NVIDIA_TRITON_SERVER_VERSION=${TRITON_CONTAINER_VERSION}
 ENV TRITON_SERVER_GPU_ENABLED=1
@@ -81,6 +93,8 @@ ENV TCMALLOC_RELEASE_RATE=200
 ENV NVIDIA_PRODUCT_NAME="Triton Server"
 ENV DEBIAN_FRONTEND=noninteractive
 
+# One Python environment is shared by Triton Python backend, vLLM backend, and
+# the pip-installed torch wheel used as the no-NGC LibTorch source.
 RUN python3 -m venv /opt/venv \
  && /opt/venv/bin/python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
  && /opt/venv/bin/python -m pip install --no-cache-dir \
@@ -114,7 +128,11 @@ ARG CUBLAS_VER=12.4.5.8-1
 ARG CUDNN_VER=9.1.0.70-1
 ARG TRT_VER=8.6.1.6-1+cuda12.0
 ARG BUILD_PARALLEL=1
+ARG ENABLE_PYTORCH_BACKEND=1
+ARG PYTORCH_CXX11_ABI=0
 
+# Build-only toolchain and development headers. These stay in the builder stage
+# and are not copied into the final runtime image.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       autoconf \
@@ -152,7 +170,8 @@ RUN apt-get update \
 
 RUN python3 -m pip install --no-cache-dir --upgrade cmake==3.27.7
 
-# Install boost version >= 1.78 for boost::span.
+# Triton r24.04 expects a newer Boost than this Astra base provides for
+# boost::span. Header-only replacement is enough for this build.
 RUN wget -O /tmp/boost.tar.gz \
       https://archives.boost.io/release/1.80.0/source/boost_1_80_0.tar.gz \
  && tar -xzf /tmp/boost.tar.gz -C /tmp \
@@ -162,7 +181,10 @@ RUN wget -O /tmp/boost.tar.gz \
 
 WORKDIR /workspace
 
-# Patch Triton third_party recipes for Astra/glibc compatibility.
+# Use a local, patched Triton third_party checkout instead of FetchContent's
+# pristine upstream copy. The patches below avoid libevent sample/test builds
+# and replace a libevent RNG call that is incompatible with this glibc/Astra
+# environment.
 RUN <<'BASH'
 set -euxo pipefail
 git clone --depth=1 --single-branch -b "r${TRITON_CONTAINER_VERSION}" \
@@ -221,41 +243,79 @@ python3 /tmp/patch_third_party.py
 rm -f /tmp/patch_third_party.py
 BASH
 
+# Clone the exact Triton Server release branch expected by the build args and
+# fail early if the source tree reports a different Triton version.
 RUN git clone --branch ${TRITON_SERVER_REF} --single-branch \
       ${TRITON_SERVER_REPO} \
       /workspace/server \
  && test "$(tr -d '[:space:]' < /workspace/server/TRITON_VERSION)" = "${TRITON_VERSION}"
 
-RUN python3 /workspace/server/build.py \
-      -v \
-      --no-container-build \
-      --build-dir /tmp/tritonbuild \
-      --install-dir /opt/tritonserver \
-      --cmake-dir /workspace/server \
-      -j ${BUILD_PARALLEL} \
-      --version ${TRITON_VERSION} \
-      --container-version ${TRITON_CONTAINER_VERSION} \
-      --upstream-container-version ${TRITON_CONTAINER_VERSION} \
-      --target-platform linux \
-      --target-machine x86_64 \
-      --backend python \
-      --backend vllm \
-      --backend ensemble \
-      --endpoint http \
-      --endpoint grpc \
-      --enable-logging \
-      --enable-stats \
-      --enable-metrics \
-      --enable-gpu-metrics \
-      --enable-cpu-metrics \
-      --enable-gpu \
-      --extra-core-cmake-arg FETCHCONTENT_SOURCE_DIR_REPO-THIRD-PARTY:PATH=/opt/triton-third-party \
-      --extra-core-cmake-arg CMAKE_C_FLAGS:STRING=-Wno-deprecated-declarations \
-      --extra-core-cmake-arg CMAKE_CXX_FLAGS:STRING=-Wno-deprecated-declarations \
-      --extra-backend-cmake-arg python:CMAKE_CXX_FLAGS:STRING=-Wno-error=deprecated-declarations \
+# Build Triton directly in this image instead of using upstream's generated
+# Docker-in-Docker flow. Keep the backend list explicit so accidental defaults
+# do not pull NGC images.
+RUN <<'BASH'
+set -euxo pipefail
+
+build_args=(
+  -v
+  --no-container-build
+  --build-dir /tmp/tritonbuild
+  --install-dir /opt/tritonserver
+  --cmake-dir /workspace/server
+  -j "${BUILD_PARALLEL}"
+  --version "${TRITON_VERSION}"
+  --container-version "${TRITON_CONTAINER_VERSION}"
+  --upstream-container-version "${TRITON_CONTAINER_VERSION}"
+  --target-platform linux
+  --target-machine x86_64
+  --backend python
+  --backend vllm
+  --backend ensemble
+  --endpoint http
+  --endpoint grpc
+  --enable-logging
+  --enable-stats
+  --enable-metrics
+  --enable-gpu-metrics
+  --enable-cpu-metrics
+  --enable-gpu
+  --extra-core-cmake-arg FETCHCONTENT_SOURCE_DIR_REPO-THIRD-PARTY:PATH=/opt/triton-third-party
+  --extra-core-cmake-arg CMAKE_C_FLAGS:STRING=-Wno-deprecated-declarations
+  --extra-core-cmake-arg CMAKE_CXX_FLAGS:STRING=-Wno-deprecated-declarations
+  --extra-backend-cmake-arg python:CMAKE_CXX_FLAGS:STRING=-Wno-error=deprecated-declarations
+)
+
+# PyTorch backend normally defaults to nvcr.io/nvidia/pytorch. When enabled
+# here, force custom-LibTorch mode by leaving TRITON_PYTORCH_DOCKER_IMAGE empty
+# and pointing CMake at the pip-installed torch headers and libraries.
+case "${ENABLE_PYTORCH_BACKEND}" in
+  0|false|FALSE|off|OFF)
+    ;;
+  1|true|TRUE|on|ON)
+    build_args+=(
+      --backend pytorch
+      --override-backend-cmake-arg pytorch:TRITON_PYTORCH_DOCKER_IMAGE=
+      --override-backend-cmake-arg pytorch:TRITON_PYTORCH_ENABLE_TORCHTRT=OFF
+      --extra-backend-cmake-arg pytorch:TRITON_PYTORCH_ENABLE_TORCHVISION:BOOL=OFF
+      --extra-backend-cmake-arg "pytorch:CMAKE_CXX_FLAGS:STRING=-D_GLIBCXX_USE_CXX11_ABI=${PYTORCH_CXX11_ABI} -Wno-deprecated-declarations -Wno-error=deprecated-declarations"
+      --extra-backend-cmake-arg "pytorch:CMAKE_CXX_FLAGS_RELEASE:STRING=-O1 -DNDEBUG -g0"
+      --extra-backend-cmake-arg "pytorch:TRITON_PYTORCH_INCLUDE_PATHS:STRING=/opt/venv/lib/python3.11/site-packages/torch/include;/opt/venv/lib/python3.11/site-packages/torch/include/torch/csrc/api/include"
+      --extra-backend-cmake-arg "pytorch:TRITON_PYTORCH_LIB_PATHS:STRING=/opt/venv/lib/python3.11/site-packages/torch/lib"
+    )
+    ;;
+  *)
+    echo "ENABLE_PYTORCH_BACKEND must be 0/1, false/true, or off/on" >&2
+    exit 1
+    ;;
+esac
+
+# Copy Triton's standard entrypoint fragments and license into the install tree
+# after a successful build so the final image looks like a normal Triton image.
+python3 /workspace/server/build.py "${build_args[@]}" \
  && mkdir -p /opt/nvidia/entrypoint.d \
  && cp -a /workspace/server/docker/entrypoint.d/. /opt/nvidia/entrypoint.d/ \
  && cp /workspace/server/NVIDIA_Deep_Learning_Container_License.pdf /opt/tritonserver/
+BASH
 
 ###############################################################################
 # Final runtime image.
@@ -268,6 +328,7 @@ LABEL com.nvidia.tritonserver.version="${TRITON_VERSION}"
 LABEL com.nvidia.build.id="unified-dockerfile-experimental"
 LABEL com.nvidia.build.ref=""
 
+# Match the user convention used by NVIDIA Triton containers.
 RUN if ! id -u triton-server > /dev/null 2>&1; then \
       useradd --uid 1000 --user-group triton-server; \
     fi
@@ -275,6 +336,7 @@ RUN if ! id -u triton-server > /dev/null 2>&1; then \
 COPY --from=builder --chown=1000:1000 /opt/tritonserver /opt/tritonserver
 COPY --from=builder /opt/nvidia/entrypoint.d /opt/nvidia/entrypoint.d
 
+# Triton listens on HTTP, gRPC, and metrics ports by default.
 WORKDIR /opt/tritonserver
 EXPOSE 8000 8001 8002
 ENTRYPOINT ["/opt/tritonserver/bin/tritonserver"]
