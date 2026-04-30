@@ -3,3 +3,4 @@ hf_home
 *.env
 .codex
 *__pycache__
+ignore
