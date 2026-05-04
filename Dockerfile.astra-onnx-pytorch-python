@@ -1,0 +1,103 @@
+# syntax=docker/dockerfile:1.6
+
+FROM nvcr.io/nvidia/tritonserver:24.04-py3 AS triton
+
+FROM registry.astralinux.ru/library/astra/ubi18:1.8.5
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Минимальный набор системных библиотек Astra, который нужен runtime-образу:
+# X/GLib-зависимости требуются отдельным backend/shared libraries из NGC image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libb64-0d \
+    libexpat1 \
+    libglib2.0-0 \
+    libgomp1 \
+    libnuma1 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb \
+    && dpkg -i cuda-keyring_1.1-1_all.deb \
+    && rm -f cuda-keyring_1.1-1_all.deb
+
+# DCGM оставлен для GPU metrics Triton. cuda-cudart-12-4 не ставим через apt:
+# согласованный CUDA runtime копируется из nvcr.io/nvidia/tritonserver:24.04-py3.
+# Validation suite от DCGM занимает сотни MB и не нужен для serving.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    datacenter-gpu-manager \
+    libxml2 \
+    && rm -rf /usr/share/nvidia-validation-suite \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /models
+
+# Runtime payload копируется через bind mount и cp -a, а не через Docker COPY.
+# В этом Dockerfile COPY с glob'ами материализовал symlink chains как отдельные
+# полные файлы и добавлял несколько GB на cuDNN/NCCL/TensorRT.
+# Содержимое targets/. копируется в уже существующий каталог targets. Без "/."
+# получался вложенный путь targets/targets, и dynamic linker не видел
+# libcupti.so.12 и другие CUDA libraries через /usr/local/cuda/lib64.
+# Целевой flavor поддерживает только ONNX Runtime, PyTorch и Python backend.
+# Тяжелые backend'ы удаляются в том же layer, чтобы они не попали в image.
+# Для serving ONNX/PyTorch не нужен TensorRT builder/parser toolchain:
+# libnvinfer.so и libnvinfer_plugin.so оставлены, потому что PyTorch backend
+# runtime зависит от них через libtorchtrt_runtime.so.
+# pip/wheel и Python test/cache payload удалены: это runtime image, не SDK.
+RUN --mount=from=triton,source=/,target=/triton,ro \
+    mkdir -p \
+      /opt \
+      /usr/local/cuda-12.4 \
+      /usr/local/lib \
+      /usr/lib/x86_64-linux-gnu \
+    && cp -a /triton/opt/tritonserver /opt/tritonserver \
+    && cp -a /triton/opt/hpcx /opt/hpcx \
+    && cp -a /triton/usr/local/cuda-12.4/targets/. /usr/local/cuda-12.4/targets/ \
+    && cp -a /triton/usr/local/cuda-12.4/nvvm /usr/local/cuda-12.4/nvvm \
+    && cp -a /triton/usr/local/cuda-12.4/compat /usr/local/cuda-12.4/compat \
+    && cp -a /triton/usr/local/cuda-12.4/gds /usr/local/cuda-12.4/gds \
+    && cp -a /triton/usr/local/cuda-12.4/nvml /usr/local/cuda-12.4/nvml \
+    && cp -a /triton/usr/lib/python3.10 /usr/lib/python3.10 \
+    && cp -a /triton/usr/local/lib/python3.10 /usr/local/lib/python3.10 \
+    && cp -a \
+      /triton/usr/lib/x86_64-linux-gnu/libarchive.so.13* \
+      /triton/usr/lib/x86_64-linux-gnu/libpython3.10.so* \
+      /triton/usr/lib/x86_64-linux-gnu/libcudnn* \
+      /triton/usr/lib/x86_64-linux-gnu/libnccl* \
+      /triton/usr/lib/x86_64-linux-gnu/libnvinfer* \
+      /triton/usr/lib/x86_64-linux-gnu/libnvonnxparser* \
+      /usr/lib/x86_64-linux-gnu/ \
+    && ln -sfn targets/x86_64-linux/include /usr/local/cuda-12.4/include \
+    && ln -sfn targets/x86_64-linux/lib /usr/local/cuda-12.4/lib64 \
+    && rm -rf \
+      /opt/tritonserver/backends/dali \
+      /opt/tritonserver/backends/fil \
+      /opt/tritonserver/backends/openvino \
+      /opt/tritonserver/backends/tensorflow \
+      /opt/tritonserver/backends/tensorrt \
+      /opt/tritonserver/third-party-src \
+      /usr/lib/python3.10/test \
+      /usr/lib/x86_64-linux-gnu/libnvinfer_builder_resource.so* \
+      /usr/lib/x86_64-linux-gnu/libnvinfer_dispatch.so* \
+      /usr/lib/x86_64-linux-gnu/libnvinfer_lean.so* \
+      /usr/lib/x86_64-linux-gnu/libnvinfer_vc_plugin.so* \
+      /usr/lib/x86_64-linux-gnu/libnvonnxparser.so* \
+      /usr/local/lib/python3.10/dist-packages/pip \
+      /usr/local/lib/python3.10/dist-packages/pip-* \
+      /usr/local/lib/python3.10/dist-packages/wheel \
+      /usr/local/lib/python3.10/dist-packages/wheel-* \
+    && find /usr/lib/python3.10 /usr/local/lib/python3.10 -type d -name __pycache__ -prune -exec rm -rf {} +
+
+RUN ln -sfn /usr/local/cuda-12.4 /usr/local/cuda
+
+ENV PATH="/opt/tritonserver/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/tritonserver/lib:/opt/tritonserver/backends/onnxruntime:/opt/hpcx/ucc/lib:/opt/hpcx/ucx/lib:/opt/hpcx/ompi/lib:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu"
+ENV PYTHONPATH="/usr/local/lib/python3.10/dist-packages"
+
+EXPOSE 8000 8001 8002
+
+CMD ["tritonserver", "--model-repository=/models"]
