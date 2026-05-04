@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1.6
+
+FROM nvcr.io/nvidia/tritonserver:24.04-py3-sdk AS sdk
+
+FROM registry.astralinux.ru/library/astra/ubi18:1.8.5
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# perf_analyzer из SDK image почти полностью самодостаточный, но динамически
+# зависит от OpenSSL, libb64 и CUDA runtime. Остальное берем из Astra base.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libb64-0d \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sdk /workspace/install/bin/perf_analyzer /usr/local/bin/perf_analyzer
+COPY --from=sdk /usr/local/cuda-12.4/targets/x86_64-linux/lib/libcudart.so* /usr/local/cuda-12.4/targets/x86_64-linux/lib/
+
+RUN ln -sfn /usr/local/cuda-12.4 /usr/local/cuda \
+    && ln -sfn targets/x86_64-linux/lib /usr/local/cuda-12.4/lib64
+
+ENV PATH="/usr/local/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu"
+
+ENTRYPOINT ["perf_analyzer"]

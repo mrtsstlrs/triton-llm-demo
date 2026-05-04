@@ -171,6 +171,65 @@ docker run --rm --gpus all --name triton-trt \
 
 Ограничение: `tensorrt_add` из текущего `model_repository` не содержит готовый `.plan`. Для реального теста нужен заранее собранный TensorRT engine, совместимый с GPU и TensorRT `8.6.3` из Triton 24.04. На RTX 5070 / `sm_120` этот старый TensorRT stack может не подойти.
 
+## Perf Analyzer на Astra
+
+`Dockerfile.perf_analyzer` собирает отдельный Astra client image с `perf_analyzer` из `nvcr.io/nvidia/tritonserver:24.04-py3-sdk`.
+
+Итоговый образ:
+
+```text
+triton-perf-analyzer:24.04-astra
+```
+
+Проверенный размер локального image: `198MB`.
+
+Сборка:
+
+```bash
+docker build \
+  -t triton-perf-analyzer:24.04-astra \
+  -f Dockerfile.perf_analyzer \
+  .
+```
+
+Проверка версии:
+
+```bash
+docker run --rm triton-perf-analyzer:24.04-astra --version
+```
+
+Ожидаемый вывод:
+
+```text
+Perf Analyzer Version 2.45.0
+```
+
+Пример запуска против Triton container `triton`:
+
+```bash
+docker run --rm --network container:triton \
+  triton-perf-analyzer:24.04-astra \
+  -m onnx_add \
+  -i http \
+  -u 127.0.0.1:8000
+```
+
+Для моделей с фиксированным input JSON:
+
+```bash
+docker run --rm --network container:triton \
+  -v "$PWD/perf_inputs:/inputs:ro" \
+  triton-perf-analyzer:24.04-astra \
+  -m minilm_onnx \
+  -i http \
+  -u 127.0.0.1:8000 \
+  -b 1 \
+  --shape input_ids:8 \
+  --shape attention_mask:8 \
+  --shape token_type_ids:8 \
+  --input-data /inputs/minilm_onnx.json
+```
+
 ## Тестовые модели
 
 `model_repository/` содержит тестовые модели для проверки backend'ов и Triton API.
