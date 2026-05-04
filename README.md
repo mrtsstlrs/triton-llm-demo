@@ -1,4 +1,4 @@
-# Triton Server на Astra Linux: ONNX Runtime, PyTorch, Python
+## Triton Server на Astra Linux: ONNX Runtime, PyTorch, Python
 
 `Dockerfile.astra-onnx-pytorch-python` собирает slim runtime-образ Triton Server на базе Astra Linux.
 Образ рассчитан на serving моделей через backend'ы `onnxruntime`, `pytorch` и `python`.
@@ -126,6 +126,50 @@ docker run --rm --gpus all --name triton-vllm \
 ```
 
 Ограничение: `vllm_model` из текущего `model_repository` ссылается на `Qwen/Qwen2.5-1.5B-Instruct`, поэтому при загрузке модели Triton будет скачивать веса из Hugging Face, если они не закэшированы. Кроме того, vLLM stack Triton 24.04 использует `torch 2.1.2+cu121`; на RTX 5070 / `sm_120` этот stack ожидаемо не подходит без более нового PyTorch/vLLM/CUDA набора или пересборки CUDA extensions.
+
+## TensorRT flavor на Astra
+
+`Dockerfile.astra-trt` собирает отдельный Astra runtime только для Triton TensorRT backend.
+
+Итоговый образ:
+
+```text
+tritonserver:24.04-trt-astra-slim
+```
+
+Проверенный размер локального image: `3.35GB`.
+
+Сборка:
+
+```bash
+docker build \
+  -t tritonserver:24.04-trt-astra-slim \
+  -f Dockerfile.astra-trt \
+  .
+```
+
+В этом flavor переносится:
+
+- Triton Server `2.45.0`;
+- TensorRT backend;
+- TensorRT runtime/parser/builder resource libraries из `nvcr.io/nvidia/tritonserver:24.04-py3`;
+- минимальный набор CUDA libraries, который нужен TensorRT backend'у.
+
+Для уменьшения размера не переносятся Python/ONNX/PyTorch/TensorFlow/DALI/OpenVINO/FIL backend'ы и полный CUDA toolkit. Полный DCGM пакет не устанавливается; копируется только `libdcgm.so*`, потому что `tritonserver` бинарно связан с этой библиотекой. Запускать этот flavor лучше с `--allow-gpu-metrics=false`.
+
+Старт Triton без загрузки модели:
+
+```bash
+docker run --rm --gpus all --name triton-trt \
+  -v "$PWD/model_repository:/models:ro" \
+  -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+  tritonserver:24.04-trt-astra-slim \
+  tritonserver --model-repository=/models \
+  --model-control-mode=explicit \
+  --allow-gpu-metrics=false
+```
+
+Ограничение: `tensorrt_add` из текущего `model_repository` не содержит готовый `.plan`. Для реального теста нужен заранее собранный TensorRT engine, совместимый с GPU и TensorRT `8.6.3` из Triton 24.04. На RTX 5070 / `sm_120` этот старый TensorRT stack может не подойти.
 
 ## Тестовые модели
 
