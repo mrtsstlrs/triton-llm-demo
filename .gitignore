@@ -4,3 +4,4 @@ hf_home
 .codex
 *__pycache__
 ignore
+*.onnx
