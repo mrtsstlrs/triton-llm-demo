@@ -1,12 +1,15 @@
-# Triton Server на Astra Linux
+# Triton Server на Astra Linux: ONNX Runtime, PyTorch, Python
 
-`Dockerfile.astra-py310-shim` собирает целевой runtime-образ Triton Server на базе Astra Linux.
+`Dockerfile.astra-onnx-pytorch-python` собирает slim runtime-образ Triton Server на базе Astra Linux.
+Образ рассчитан на serving моделей через backend'ы `onnxruntime`, `pytorch` и `python`.
 
 Итоговый образ:
 
 ```text
-tritonserver:24.04-astra-shim
+tritonserver:24.04-py3-astra-slim
 ```
+
+Проверенный размер локального image: `13.7GB`.
 
 Dockerfile использует:
 
@@ -20,36 +23,109 @@ FROM registry.astralinux.ru/library/astra/ubi18:1.8.5
 - `/opt/tritonserver`
 - Python 3.10 runtime, нужный Python backend'у Triton 24.04
 - CUDA 12.4 runtime libraries
-- cuDNN / NCCL / TensorRT runtime libraries
+- cuDNN / NCCL / минимальный TensorRT runtime, который нужен PyTorch backend'у
 - HPCX UCX/UCC/OpenMPI libraries
 
 Образ запускает Triton Server `2.45.0` / release `24.04` на Astra runtime. Проверенные backend'ы: `onnxruntime`, `pytorch`, `python`.
+
+Для уменьшения размера в Dockerfile удаляются:
+
+- backend'ы `tensorflow`, `dali`, `openvino`, `fil`, `tensorrt`;
+- TensorRT builder/parser libraries, не нужные для serving текущих ONNX/PyTorch моделей;
+- `pip`, `wheel`, Python test/cache payload;
+- DCGM validation suite;
+- дублирующая установка CUDA runtime через apt.
 
 Сборка:
 
 ```bash
 docker build \
-  -t tritonserver:24.04-astra-shim \
-  -f Dockerfile.astra-py310-shim \
+  -t tritonserver:24.04-py3-astra-slim \
+  -f Dockerfile.astra-onnx-pytorch-python \
   .
 ```
 
 Проверить backend libraries:
 
 ```bash
-docker run --rm --entrypoint /bin/bash tritonserver:24.04-astra-shim -lc \
+docker run --rm --entrypoint /bin/bash tritonserver:24.04-py3-astra-slim -lc \
   'find /opt/tritonserver/backends -maxdepth 2 -type f -name "libtriton_*.so" -printf "%h/%f\n" | sort'
 ```
 
 Для `onnxruntime` и `pytorch` также полезно проверить, что нет незакрытых dynamic dependencies:
 
 ```bash
-docker run --rm --entrypoint /bin/bash tritonserver:24.04-astra-shim -lc \
+docker run --rm --entrypoint /bin/bash tritonserver:24.04-py3-astra-slim -lc \
   'ldd /opt/tritonserver/backends/onnxruntime/libtriton_onnxruntime.so | grep "not found" || true'
 
-docker run --rm --entrypoint /bin/bash tritonserver:24.04-astra-shim -lc \
+docker run --rm --entrypoint /bin/bash tritonserver:24.04-py3-astra-slim -lc \
   'ldd /opt/tritonserver/backends/pytorch/libtriton_pytorch.so | grep "not found" || true'
 ```
+
+## vLLM flavor на Astra
+
+`Dockerfile.astra-vllm` собирает отдельный Astra runtime только для Triton vLLM backend.
+
+Итоговый образ:
+
+```text
+tritonserver:24.04-vllm-python-astra-slim
+```
+
+Проверенный размер локального image: `9.97GB`.
+
+Сборка:
+
+```bash
+docker build \
+  -t tritonserver:24.04-vllm-python-astra-slim \
+  -f Dockerfile.astra-vllm \
+  .
+```
+
+В этом flavor переносится:
+
+- Triton Server `2.45.0`;
+- Python backend и `backends/vllm/model.py`;
+- Python 3.10 runtime;
+- vLLM Python stack из `nvcr.io/nvidia/tritonserver:24.04-vllm-python-py3`;
+- CUDA/cuDNN/NCCL libraries из Python wheel-пакетов `site-packages/nvidia`.
+
+Для уменьшения размера не переносится полный CUDA toolkit и не устанавливается полный DCGM пакет. Копируется только `libdcgm.so*`, потому что `tritonserver` бинарно связан с этой библиотекой. Запускать этот flavor лучше с `--allow-gpu-metrics=false`.
+
+Проверка runtime:
+
+```bash
+docker run --rm --entrypoint /bin/bash tritonserver:24.04-vllm-python-astra-slim -lc \
+  'python3 - <<PY
+import torch, vllm
+print("torch", torch.__version__)
+print("cuda", torch.version.cuda)
+print("vllm", vllm.__version__)
+PY'
+```
+
+Проверенные версии:
+
+```text
+torch 2.1.2+cu121
+cuda 12.1
+vllm 0.4.0.post1
+```
+
+Старт Triton без загрузки модели:
+
+```bash
+docker run --rm --gpus all --name triton-vllm \
+  -v "$PWD/model_repository:/models:ro" \
+  -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+  tritonserver:24.04-vllm-python-astra-slim \
+  tritonserver --model-repository=/models \
+  --model-control-mode=explicit \
+  --allow-gpu-metrics=false
+```
+
+Ограничение: `vllm_model` из текущего `model_repository` ссылается на `Qwen/Qwen2.5-1.5B-Instruct`, поэтому при загрузке модели Triton будет скачивать веса из Hugging Face, если они не закэшированы. Кроме того, vLLM stack Triton 24.04 использует `torch 2.1.2+cu121`; на RTX 5070 / `sm_120` этот stack ожидаемо не подходит без более нового PyTorch/vLLM/CUDA набора или пересборки CUDA extensions.
 
 ## Тестовые модели
 
@@ -130,7 +206,7 @@ Echo-модель для проверки Python backend и custom metrics.
 ### Нерабочие/отложенные модели
 
 - `vllm_model`: в `24.04-py3` нет backend `vllm`, поэтому эта модель не должна загружаться в текущем образе.
-- `tensorrt_add`: содержит ONNX-заготовку и config для TensorRT, но `.plan` не создан. TensorRT `8.6.3` из Triton 24.04 не смог собрать engine на GPU с `sm_120`.
+- `tensorrt_add`: текущий slim flavor не содержит TensorRT backend, поэтому эта модель не должна загружаться в этом образе.
 
 ## Запуск Triton Server
 
@@ -140,7 +216,7 @@ Echo-модель для проверки Python backend и custom metrics.
 docker run --rm --gpus all --name triton \
   -v "$PWD/model_repository:/models:ro" \
   -p 8000:8000 -p 8001:8001 -p 8002:8002 \
-  tritonserver:24.04-astra-shim \
+  tritonserver:24.04-py3-astra-slim \
   tritonserver --model-repository=/models \
   --model-control-mode=explicit \
   --load-model=onnx_add \
@@ -153,7 +229,7 @@ docker run --rm --gpus all --name triton \
 docker run --rm --gpus all --name triton \
   -v "$PWD/model_repository:/models:ro" \
   -p 8000:8000 -p 8001:8001 -p 8002:8002 \
-  tritonserver:24.04-astra-shim \
+  tritonserver:24.04-py3-astra-slim \
   tritonserver --model-repository=/models \
   --model-control-mode=explicit \
   --load-model=onnx_add \
@@ -388,17 +464,21 @@ onnx_ready True
 
 ## Известные ограничения
 
-- Текущий vLLM stack `vllm==0.4.0.post1` подтягивает `torch 2.1.2+cu121`. Он не поддерживает RTX 5070 / CUDA capability `sm_120`.
-- На GPU с `sm_120` `vllm_model` падает с:
+- В образе оставлены только backend'ы `onnxruntime`, `pytorch`, `python` и маленькие utility backend'ы `identity`, `repeat`, `square`.
+- Backend'ы `tensorflow`, `dali`, `openvino`, `fil`, `tensorrt`, `vllm` отсутствуют.
+- TensorRT engine build внутри этого образа не поддерживается: TensorRT backend и builder/parser libraries удалены для уменьшения размера.
+- В runtime нет `pip`, `wheel` и Python CLI tooling; Python runtime-библиотеки оставлены для Triton Python backend.
+- PyTorch backend использует runtime-библиотеки из Triton/NVIDIA 24.04 stack. Версия PyTorch stack: `2.3.0a0+6ddf5cf85e`.
+- `python_model` из `model_repository` является тестовой моделью Python backend: она создает custom metric и отвечает echo-строкой на `BYTES` input.
+- `Dockerfile.astra-onnx-pytorch-python` использует `nvcr.io/nvidia/tritonserver:24.04-py3` как source stage для переноса Triton Server и согласованных runtime-библиотек в Astra image.
+- Старый vLLM stack `vllm==0.4.0.post1`, который рассматривался ранее, подтягивал `torch 2.1.2+cu121` и не поддерживал RTX 5070 / CUDA capability `sm_120`.
+- На GPU с `sm_120` такой `vllm_model` падал с:
 
 ```text
 RuntimeError: CUDA error: no kernel image is available for execution on the device
 ```
 
 - Для GPU с `sm_120` нужен другой PyTorch/vLLM/CUDA stack с поддержкой `sm_120` или сборка соответствующих CUDA extensions под эту архитектуру.
-- `python_model` из `model_repository` является тестовой моделью Python backend: она создает custom metric и отвечает echo-строкой на `BYTES` input.
-- `Dockerfile.astra-py310-shim` использует `nvcr.io/nvidia/tritonserver:24.04-py3` как source stage для переноса Triton Server и согласованных runtime-библиотек в Astra image.
-- TensorRT backend в образе присутствует, но на `sm_120` TensorRT `8.6.3` из Triton 24.04 не смог собрать тестовый engine через `trtexec`.
 
 ## Безопасность и воспроизводимость
 
