@@ -1,0 +1,79 @@
+# syntax=docker/dockerfile:1.6
+
+FROM nvcr.io/nvidia/tritonserver:24.04-vllm-python-py3 AS triton
+
+FROM registry.astralinux.ru/library/astra/ubi18:1.8.5
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Минимальный Astra runtime для Triton + Python backend. Полный DCGM пакет не
+# ставим: для vLLM flavor цель по размеру важнее GPU metrics, а пакет DCGM
+# добавляет примерно гигабайт к image. Ниже копируется только libdcgm.so,
+# потому что tritonserver бинарно связан с этой библиотекой.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libb64-0d \
+    libexpat1 \
+    libglib2.0-0 \
+    libgomp1 \
+    libnuma1 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libxml2 \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /models
+
+# vLLM backend в Triton 24.04 - это Python backend + backend/vllm/model.py.
+# Не копируем весь CUDA toolkit из source image: torch/vLLM wheels уже несут
+# CUDA/cuDNN/NCCL libraries в site-packages/nvidia, а LD_LIBRARY_PATH ниже
+# указывает на эти каталоги. Это главный шаг, который удерживает image <15GB.
+# Копируем только Triton runtime, Python 3.10, vLLM Python environment и
+# несколько системных shared libraries, которых нет в Astra base.
+RUN --mount=from=triton,source=/,target=/triton,ro \
+    mkdir -p \
+      /opt/tritonserver/backends \
+      /usr/bin \
+      /usr/local/bin \
+      /usr/local/lib \
+      /usr/lib/x86_64-linux-gnu \
+    && cp -a /triton/opt/tritonserver/bin /opt/tritonserver/bin \
+    && cp -a /triton/opt/tritonserver/lib /opt/tritonserver/lib \
+    && cp -a /triton/opt/tritonserver/caches /opt/tritonserver/caches \
+    && cp -a /triton/opt/tritonserver/repoagents /opt/tritonserver/repoagents \
+    && cp -a /triton/opt/tritonserver/backends/python /opt/tritonserver/backends/python \
+    && cp -a /triton/opt/tritonserver/backends/vllm /opt/tritonserver/backends/vllm \
+    && cp -a /triton/usr/bin/python3.10 /usr/bin/python3.10 \
+    && ln -sfn python3.10 /usr/bin/python3 \
+    && cp -a /triton/usr/lib/python3.10 /usr/lib/python3.10 \
+    && cp -a /triton/usr/local/lib/python3.10 /usr/local/lib/python3.10 \
+    && cp -a \
+      /triton/usr/lib/x86_64-linux-gnu/libarchive.so.13* \
+      /triton/usr/lib/x86_64-linux-gnu/libdcgm.so* \
+      /triton/usr/lib/x86_64-linux-gnu/libpython3.10.so* \
+      /usr/lib/x86_64-linux-gnu/ \
+    && rm -rf \
+      /opt/tritonserver/third-party-src \
+      /usr/lib/python3.10/test \
+      /usr/local/lib/python3.10/dist-packages/pip \
+      /usr/local/lib/python3.10/dist-packages/pip-* \
+      /usr/local/lib/python3.10/dist-packages/wheel \
+      /usr/local/lib/python3.10/dist-packages/wheel-* \
+      /usr/local/lib/python3.10/dist-packages/cmake \
+      /usr/local/lib/python3.10/dist-packages/cmake-* \
+      /usr/local/lib/python3.10/dist-packages/virtualenv \
+      /usr/local/lib/python3.10/dist-packages/virtualenv-* \
+      /usr/local/lib/python3.10/dist-packages/ninja \
+      /usr/local/lib/python3.10/dist-packages/ninja-* \
+    && find /usr/lib/python3.10 /usr/local/lib/python3.10 -type d \( -name __pycache__ -o -name tests -o -name test \) -prune -exec rm -rf {} +
+
+ENV PYTHON_SITE_PACKAGES="/usr/local/lib/python3.10/dist-packages"
+ENV PATH="/opt/tritonserver/bin:/usr/local/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/tritonserver/lib:/opt/tritonserver/backends/python:${PYTHON_SITE_PACKAGES}/torch/lib:${PYTHON_SITE_PACKAGES}/nvidia/cublas/lib:${PYTHON_SITE_PACKAGES}/nvidia/cuda_cupti/lib:${PYTHON_SITE_PACKAGES}/nvidia/cuda_nvrtc/lib:${PYTHON_SITE_PACKAGES}/nvidia/cuda_runtime/lib:${PYTHON_SITE_PACKAGES}/nvidia/cudnn/lib:${PYTHON_SITE_PACKAGES}/nvidia/cufft/lib:${PYTHON_SITE_PACKAGES}/nvidia/curand/lib:${PYTHON_SITE_PACKAGES}/nvidia/cusolver/lib:${PYTHON_SITE_PACKAGES}/nvidia/cusparse/lib:${PYTHON_SITE_PACKAGES}/nvidia/nccl/lib:${PYTHON_SITE_PACKAGES}/nvidia/nvjitlink/lib:${PYTHON_SITE_PACKAGES}/nvidia/nvtx/lib:/usr/lib/x86_64-linux-gnu"
+ENV PYTHONPATH="${PYTHON_SITE_PACKAGES}"
+
+EXPOSE 8000 8001 8002
+
+CMD ["tritonserver", "--model-repository=/models", "--allow-gpu-metrics=false"]
