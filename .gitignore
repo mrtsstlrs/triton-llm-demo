@@ -5,3 +5,6 @@ hf_home
 *__pycache__
 ignore
 *.onnx
+model_analyzer/checkpoints/
+model_analyzer/perf_output.log
+model_analyzer/results/
