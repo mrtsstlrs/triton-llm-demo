@@ -1,0 +1,95 @@
+# syntax=docker/dockerfile:1.6
+
+FROM nvcr.io/nvidia/tritonserver:24.04-py3-sdk AS sdk
+
+FROM registry.astralinux.ru/library/astra/ubi18:1.8.5
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Базовые системные пакеты Astra для запуска SDK tools, Python wheel'ов,
+# C++ client examples, Java bindings и сетевых клиентов.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    wget \
+    build-essential \
+    cmake \
+    default-jdk-headless \
+    libb64-0d \
+    libbz2-1.0 \
+    libexpat1 \
+    libffi8 \
+    libfreetype6 \
+    libgcc-s1 \
+    libgdbm-compat4 \
+    libgdbm6 \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    libice6 \
+    liblzma5 \
+    libncursesw6 \
+    libnsl2 \
+    libnuma1 \
+    libpng16-16 \
+    libreadline8 \
+    libsm6 \
+    libsqlite3-0 \
+    libssl3 \
+    libstdc++6 \
+    libtirpc3 \
+    libuuid1 \
+    libxext6 \
+    libxrender1 \
+    zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+# SDK artifacts: perf_analyzer, C++ clients, headers, libraries, Java examples,
+# Python client sources/tests and the same /workspace layout as the NVIDIA SDK image.
+COPY --from=sdk /workspace /workspace
+
+# Python 3.10 runtime from the SDK image. Astra 1.8 ships Python 3.11, while
+# Triton SDK 24.04 installs model-analyzer/tritonclient wheels for Python 3.10.
+COPY --from=sdk /usr/bin/python3.10 /usr/bin/python3.10
+COPY --from=sdk /usr/lib/python3.10 /usr/lib/python3.10
+COPY --from=sdk /usr/lib/python3 /usr/lib/python3
+COPY --from=sdk /usr/lib/python3/dist-packages /usr/lib/python3/dist-packages
+
+# Полный /usr/local из SDK: CUDA toolkit/runtime, Python site-packages,
+# model-analyzer, genai-perf, Nsight CLI wrappers, NCCL perf binaries и pip.
+COPY --from=sdk /usr/local /usr/local
+
+# HPC-X/OpenMPI/UCX и NVIDIA entrypoint/profiling assets нужны для NCCL/MPI
+# утилит и профилировщиков, которые входят в SDK image.
+COPY --from=sdk /opt/hpcx /opt/hpcx
+COPY --from=sdk /opt/nvidia /opt/nvidia
+
+# NCCL libraries в SDK лежат в системной lib-dir; переносим их отдельно, чтобы
+# all_reduce_perf и другие NCCL tools запускались без установки CUDA repo.
+COPY --from=sdk /usr/lib/x86_64-linux-gnu/libnccl.so* /usr/lib/x86_64-linux-gnu/
+
+RUN ln -sfn python3.10 /usr/bin/python3 \
+    && ln -sfn /usr/bin/python3 /usr/bin/python \
+    && ln -sfn /usr/local/bin/pip3.10 /usr/local/bin/pip3 \
+    && ln -sfn /usr/local/bin/pip3.10 /usr/local/bin/pip \
+    && ln -sfn /usr/local/cuda-12.4 /usr/local/cuda \
+    && ln -sfn /usr/local/cuda-12.4 /usr/local/cuda-12 \
+    && ln -sfn /opt/hpcx/ompi /usr/local/mpi \
+    && ln -sfn /opt/hpcx/ucx /usr/local/ucx \
+    && ldconfig
+
+ENV PATH="/workspace/install/bin:/usr/local/mpi/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin"
+ENV LD_LIBRARY_PATH="/opt/hpcx/ompi/lib:/opt/hpcx/ucx/lib:/workspace/install/lib:/usr/local/cuda/compat/lib:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu"
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+ENV NVIDIA_PRODUCT_NAME="Triton Server SDK Astra"
+ENV NVIDIA_TRITON_SERVER_SDK_VERSION=24.04
+ENV OPAL_PREFIX=/opt/hpcx/ompi
+ENV OMPI_MCA_coll_hcoll_enable=0
+ENV CUDA_CACHE_DISABLE=1
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]

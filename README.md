@@ -230,6 +230,105 @@ docker run --rm --network container:triton \
   --input-data /inputs/minilm_onnx.json
 ```
 
+## Полный Triton SDK на Astra
+
+`Dockerfile.sdk` собирает отдельный Astra image с основными возможностями `nvcr.io/nvidia/tritonserver:24.04-py3-sdk`.
+
+В отличие от минимального `Dockerfile.perf_analyzer`, этот образ переносит:
+
+- `perf_analyzer`
+- `model-analyzer`
+- `genai-perf`
+- Python SDK: `tritonclient`, `triton-model-analyzer` и зависимости
+- C++ HTTP/gRPC client examples из `/workspace/install/bin`
+- headers/libs/client sources из `/workspace`
+- CUDA toolkit/runtime, NCCL perf tools, HPC-X/OpenMPI/UCX
+- Nsight Compute CLI и Nsight Systems CLI
+- Java runtime/JDK для Java SDK examples
+
+Итоговый образ:
+
+```text
+triton-sdk:24.04-astra
+```
+
+Проверенный размер локального image: около `11.1GB`.
+
+Сборка:
+
+```bash
+docker build \
+  -t triton-sdk:24.04-astra \
+  -f Dockerfile.sdk \
+  .
+```
+
+Быстрая проверка:
+
+```bash
+docker run --rm triton-sdk:24.04-astra perf_analyzer --version
+docker run --rm triton-sdk:24.04-astra model-analyzer --version
+docker run --rm triton-sdk:24.04-astra genai-perf --version
+```
+
+Проверка Python SDK:
+
+```bash
+docker run --rm --entrypoint /bin/sh triton-sdk:24.04-astra -c \
+  'python3 - <<PY
+import importlib.metadata as m
+for name in ["tritonclient", "triton-model-analyzer", "genai-perf"]:
+    print(f"{name}=={m.version(name)}")
+PY'
+```
+
+Пример запуска `perf_analyzer` против уже запущенного контейнера Triton `triton`:
+
+```bash
+docker run --rm --network container:triton \
+  triton-sdk:24.04-astra \
+  perf_analyzer \
+  -m onnx_add \
+  -i http \
+  -u 127.0.0.1:8000
+```
+
+Если нужен input JSON с хоста:
+
+```bash
+docker run --rm --network container:triton \
+  -v "$PWD/perf_inputs:/inputs:ro" \
+  triton-sdk:24.04-astra \
+  perf_analyzer \
+  -m minilm_onnx \
+  -i http \
+  -u 127.0.0.1:8000 \
+  -b 1 \
+  --shape input_ids:8 \
+  --shape attention_mask:8 \
+  --shape token_type_ids:8 \
+  --input-data /inputs/minilm_onnx.json
+```
+
+Минимальная проверка `model-analyzer` против уже запущенного Triton:
+
+```bash
+docker run --rm --network container:triton \
+  -v "$PWD/model_repository:/models:ro" \
+  -v "$PWD/model_analyzer:/analysis" \
+  triton-sdk:24.04-astra \
+  model-analyzer profile \
+  --model-repository /models \
+  --profile-models minilm_onnx \
+  --triton-launch-mode=remote \
+  --triton-http-endpoint 127.0.0.1:8000 \
+  --triton-grpc-endpoint 127.0.0.1:8001 \
+  --export-path /analysis \
+  --override-output-model-repository
+```
+
+Ограничение: это SDK/tools image, а не Triton server runtime. Для запуска моделей по-прежнему нужен отдельный server image.
+
 ## Тестовые модели
 
 `model_repository/` содержит тестовые модели для проверки backend'ов и Triton API.
