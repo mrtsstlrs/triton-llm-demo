@@ -70,6 +70,10 @@ COPY --from=sdk /opt/nvidia /opt/nvidia
 # all_reduce_perf и другие NCCL tools запускались без установки CUDA repo.
 COPY --from=sdk /usr/lib/x86_64-linux-gnu/libnccl.so* /usr/lib/x86_64-linux-gnu/
 
+# Model Analyzer использует DCGM bindings для discovery GPU и GPU metrics.
+# Библиотека нужна даже в remote mode, где сам Triton уже запущен отдельно.
+COPY --from=sdk /usr/lib/x86_64-linux-gnu/libdcgm.so* /usr/lib/x86_64-linux-gnu/
+
 RUN ln -sfn python3.10 /usr/bin/python3 \
     && ln -sfn /usr/bin/python3 /usr/bin/python \
     && ln -sfn /usr/local/bin/pip3.10 /usr/local/bin/pip3 \
@@ -78,6 +82,9 @@ RUN ln -sfn python3.10 /usr/bin/python3 \
     && ln -sfn /usr/local/cuda-12.4 /usr/local/cuda-12 \
     && ln -sfn /opt/hpcx/ompi /usr/local/mpi \
     && ln -sfn /opt/hpcx/ucx /usr/local/ucx \
+    && mkdir -p /usr/lib64 \
+    && ln -sfn /usr/lib/x86_64-linux-gnu/libdcgm.so.3 /usr/lib64/libdcgm.so.3 \
+    && ln -sfn /usr/lib/x86_64-linux-gnu/libdcgm.so /usr/lib64/libdcgm.so \
     && ldconfig
 
 ENV PATH="/workspace/install/bin:/usr/local/mpi/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin"
