@@ -1,0 +1,24 @@
+model_repository: /models
+profile_models:
+  minilm_onnx:
+    perf_analyzer_flags:
+      input-data: /inputs/minilm_onnx.json
+      shape:
+        - input_ids:8
+        - attention_mask:8
+        - token_type_ids:8
+      measurement-interval: 15000
+      stability-percentage: 50
+batch_sizes: 1
+concurrency: 1,2,4
+client_protocol: http
+triton_launch_mode: remote
+triton_http_endpoint: 127.0.0.1:8000
+triton_grpc_endpoint: 127.0.0.1:8001
+triton_metrics_url: http://127.0.0.1:8002/metrics
+reload_model_disable: true
+run_config_search_disable: true
+checkpoint_directory: /analysis/checkpoints
+export_path: /analysis/results
+perf_output: true
+perf_output_path: /analysis/perf_output.log
